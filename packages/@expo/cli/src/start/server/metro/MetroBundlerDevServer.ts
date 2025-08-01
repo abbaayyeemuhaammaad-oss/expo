@@ -38,7 +38,7 @@ import {
   fileURLToFilePath,
 } from './createServerComponentsMiddleware';
 import { createRouteHandlerMiddleware } from './createServerRouteMiddleware';
-import { ExpoRouterServerManifestV1, fetchManifest } from './fetchRouterManifest';
+import { ExpoRouterServerManifestV1, fetchManifest, inflateManifest } from './fetchRouterManifest';
 import { instantiateMetroAsync } from './instantiateMetro';
 import {
   attachImportStackToRootMessage,
@@ -396,8 +396,11 @@ export class MetroBundlerDevServer extends BundlerDevServer {
       // Get routes from Expo Router.
       manifest: await getManifest({ preserveApiRoutes: false, ...exp.extra?.router }),
       // Get route generating function
-      async renderAsync(path: string) {
-        return await getStaticContent(new URL(path, url));
+      renderAsync: async (pathname: string) => {
+        const location = new URL(pathname, url);
+        const loaderData = await this.executeRouteLoaderAsync(location);
+
+        return await getStaticContent(location, { loaderData });
       },
     };
   }
@@ -489,7 +492,12 @@ export class MetroBundlerDevServer extends BundlerDevServer {
       });
 
       const location = new URL(pathname, this.getDevServerUrlOrAssert());
-      return await getStaticContent(location);
+
+      // Execute loaders if the route has them
+      const loaderData = await this.executeRouteLoaderAsync(location);
+      debug('Loader data:', loaderData);
+
+      return await getStaticContent(location, { loaderData });
     };
 
     const [{ artifacts: resources }, staticHtml] = await Promise.all([
@@ -1487,6 +1495,85 @@ export class MetroBundlerDevServer extends BundlerDevServer {
 
   private invalidateApiRouteCache() {
     this.pendingRouteOperations.clear();
+  }
+
+  /**
+   * Execute a route's loader function.
+   * Used during SSR/SSG to fetch data required by routes.
+   */
+  private async executeRouteLoaderAsync(location: URL): Promise<Record<string, any> | undefined> {
+    let loaderData: Record<string, any> | undefined;
+
+    try {
+      const { serverManifest } = await this.getServerManifestAsync();
+      const inflatedManifest = inflateManifest(
+        serverManifest as ExpoRouterServerManifestV1<string>
+      );
+
+      const matchingRoute = inflatedManifest.htmlRoutes.find((route) => {
+        return route.namedRegex.test(location.pathname);
+      });
+
+      if (!matchingRoute?.loader) {
+        debug(`No loader found for route: ${location.pathname}`);
+        return;
+      }
+
+      debug('Matched route loader: ', matchingRoute.loader, ' to file: ', matchingRoute.file);
+
+      // Extract route parameters
+      const params: Record<string, string | string[]> = {};
+      const match = matchingRoute.namedRegex.exec(location.pathname);
+      if (match?.groups) {
+        for (const [key, value] of Object.entries(match.groups)) {
+          const namedKey = matchingRoute.routeKeys[key];
+          params[namedKey] = value;
+        }
+      }
+
+      // Resolve module path based on context. Metro dev server could be running in dev or export mode,
+      // and the module paths will be different in each case:
+      // - In export mode, we need absolute filesystem paths for direct loading
+      // - In dev mode, we need project-relative paths for Metro to resolve
+      let modulePath = matchingRoute.loader;
+      const { routerRoot } = this.instanceMetroOptions;
+
+      // The loader field contains the contextKey (e.g., "./index.tsx")
+      // We need to resolve it to the full module path
+      if (modulePath.startsWith('./') && routerRoot) {
+        // Remove the leading "./" from the contextKey
+        const fileName = modulePath.slice(2);
+
+        // In both dev and export modes, we need absolute filesystem paths
+        // because ssrLoadModule expects absolute paths
+        const appDir = path.join(this.projectRoot, routerRoot);
+        modulePath = path.resolve(appDir, fileName);
+      }
+
+      // Remove file extension for Metro module resolution
+      modulePath = modulePath.replace(/\.(js|ts)x?$/, '');
+
+      debug('Resolved modulePath loader: ', modulePath);
+
+      const routeModule = await this.ssrLoadModule<any>(modulePath, {
+        environment: 'node',
+      });
+
+      if (routeModule.loader) {
+        const loaderResult = await routeModule.loader({
+          params,
+          request: null, // No request object for SSG
+        });
+        loaderData = { [location.pathname]: loaderResult };
+      }
+    } catch (error: any) {
+      throw new CommandError(
+        'LOADER_EXECUTION_FAILED',
+        `Failed to execute loader for route "${location.pathname}": ${error.message}`
+      );
+    }
+
+    return loaderData;
   }
 
   // Ensure the global is available for SSR CSS modules to inject client updates.

@@ -5,6 +5,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.useRouteInfo = void 0;
+exports.useLoader = useLoader;
 exports.useRootNavigationState = useRootNavigationState;
 exports.useRootNavigation = useRootNavigation;
 exports.useNavigationContainerRef = useNavigationContainerRef;
@@ -23,6 +24,39 @@ const router_store_1 = require("./global-state/router-store");
 Object.defineProperty(exports, "useRouteInfo", { enumerable: true, get: function () { return router_store_1.useRouteInfo; } });
 const imperative_api_1 = require("./imperative-api");
 const PreviewRouteContext_1 = require("./link/preview/PreviewRouteContext");
+const context_1 = require("./loaders/context");
+/**
+ * Returns the data loaded by the route's loader function. This hook only works
+ * when `web.output: "server" | "static"` is configured in your app config.
+ *
+ * @example
+ * ```tsx app/index.tsx
+ * // Route file
+ * export async function loader({ params }) {
+ *   return { user: await fetchUser(params.id) };
+ * }
+ *
+ * export default function UserRoute() {
+ *   const data = useLoader(loader);
+ *   return <Text>{data.user.name}</Text>;
+ * }
+ * ```
+ */
+function useLoader(loader) {
+    const routePath = usePathname();
+    const loaderDataContext = react_1.default.useContext(context_1.LoaderDataContext);
+    // During SSR, use the loader data from context
+    if (loaderDataContext && routePath in loaderDataContext) {
+        return loaderDataContext[routePath];
+    }
+    if (typeof window !== 'undefined' && window.__EXPO_ROUTER_LOADER_DATA__) {
+        const preloadedData = window.__EXPO_ROUTER_LOADER_DATA__[routePath];
+        if (preloadedData !== undefined) {
+            return preloadedData;
+        }
+    }
+    throw new Error('Loaders only work with `web.output` set to `static` or `server`');
+}
 /**
  * Returns the [navigation state](https://reactnavigation.org/docs/navigation-state/)
  * of the navigator which contains the current screen.
